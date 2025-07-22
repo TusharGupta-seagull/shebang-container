@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+
+set -o errexit -o nounset -o pipefail
+shopt -s nullglob
+
+command -v jq > /dev/null || { echo "[Error] 'jq' is required but not installed."; exit 1; }
+
+btrfs_path='/var/shebang-con'
+cgroups='cpu,cpuacct,memory'
+
+[[ $# -gt 0 ]] && while [[ "${1:0:2}" == '--' ]]; do
+    OPTION="{$1:2}"
+    [[ $OPTION =~ = ]] && declare "SHEBANG_CON_${OPTION/=*/}=${OPTION/*=/}" || declare "SHEBANG_CON_${OPTION}=x";
+    shift
+done
+
+function shebang_con_check(){
+    local id="$1"
+    btrfs subvolume list "$btrfs_path" | grep -qw "$id" && echo 0 || echo 1
+}
+
+function shebang_con_init(){ #HELP Create an image from a directory:\nSHEBANG-CON init <directory>
+    local directory="$1"
+    shift
+
+    local source=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --source)
+                source="$2"
+                shift 2
+                ;;
+            *)
+                echo "[Error] Unknown option '$1'"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ -d "$directory" ]]; then
+        
+        while :; do
+            local img_id="img_$(shuf -i 42002-42254 -n 1)"
+            [[ $(shebang_con_check "$img_id") == 1 ]] && break
+        done
+
+        btrfs subvolume create "$btrfs_path/$img_id"  > /dev/null
+        cp -rf --reflink=auto "$directory"/* "$btrfs_path/$img_id" > /dev/null
+
+        [[ -z "$source" ]] && source="$directory"
+        [[ ! -f "$btrfs_path/$img_id"/img.source ]] && echo "$source" > "$btrfs_path/$img_id"/img.source
+        echo "Created: $img_id"
+    else
+        echo "[Error] No directory named \"$directory\" exists."
+    fi 
+}
+function shebang_con_pull() { #HELP Pull an image from Docker Hub:\nSHEBANG-CON pull <name> <tag>
+    local image="$1"
+    [[ "$image" == */* ]] || image="library/$image"
+
+    local tag="${2:-latest}"
+
+    # if [[ -z "$image" ]]; then
+    #     echo "[Error] No image name provided."
+    #     return 1
+    # fi
+
+    # echo "[Auth] Requesting token for: $image"
+    local token
+    token=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${image}:pull" \
+            | jq -r '.token')
+
+    #check if the image or tag is invalid
+    [[ -z "$token" || "$token" == "null" ]] && echo "[Error] Failed to get token." && return 1
+
+    # echo "[Manifest] Fetching manifest list for: $image:$tag"
+    local manifest_list
+    manifest_list=$(curl -s -H "Authorization: Bearer $token" \
+                         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+                         "https://registry-1.docker.io/v2/${image}/manifests/${tag}")
+
+    # echo "[Manifest] Extracting digest for linux/amd64..."
+    local digest
+    digest=$(echo "$manifest_list" | jq -r '.manifests[] 
+      | select(.platform.architecture=="amd64" and .platform.os=="linux") 
+      | .digest')
+
+    [[ -z "$digest" || "$digest" == "null" ]] && echo "[Error] Digest for linux/amd64 not found." && return 1
+
+    # echo "[Digest] Using manifest digest: $digest"
+    # echo "[Layers] Fetching image manifest for digest..."
+    local manifest
+    manifest=$(curl -s -H "Authorization: Bearer $token" \
+                     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                     "https://registry-1.docker.io/v2/${image}/manifests/${digest}")
+
+    # echo "[Layers] Extracting layer digests..."
+    mapfile -t layers < <(echo "$manifest" | jq -r '.layers[].digest')
+
+    # if [[ ${#layers[@]} -eq 0 ]]; then
+    #     echo "[Error] No layers found in manifest."
+    #     return 1
+    # fi
+
+    echo "[Layers] Found ${#layers[@]} layers."
+    tmp_uuid=$(uuidgen)
+    mkdir -p /tmp/"$tmp_uuid"/layers
+    mkdir -p /tmp/"$tmp_uuid"/rootfs
+
+    for layer in "${layers[@]}"; do
+        local tar_file="/tmp/$tmp_uuid/layers/${layer##*:}.tar"
+
+        echo "[Download] $layer"
+        curl --progress-bar -L -H "Authorization: Bearer $token" \
+             "https://registry-1.docker.io/v2/${image}/blobs/${layer}" \
+             -o "$tar_file"
+
+        if tar -tf "$tar_file" &> /dev/null; then
+            tar -xf "$tar_file" -C /tmp/"$tmp_uuid"/rootfs
+        else
+            echo "[Error] Invalid tar format for $layer"
+            rm "$tar_file"
+        fi
+    done
+
+    shebang_con_init /tmp/"$tmp_uuid"/rootfs --source "$image:$tag"
+    rm -rf /tmp/"$tmp_uuid"
+}
+
+function shebang_con_rm(){ #HELP Delete an image or container:\nSHEBANG-CON rm <image_id or container_id>
+    local img_id="$1"
+    [[ "$(shebang_con_check "$img_id")" == 1 ]] && echo "[Error] No image/container named $img_id exists." && exit 1
+
+    btrfs subvolume delete "$btrfs_path/$img_id" > /dev/null
+    cgdelete -g "$cgroups:/$img_id" &> /dev/null || true
+    echo "Removed: $img_id"
+}
+
+function shebang_con_images(){ #HELP List images:\nSHEBANG-CON images
+    printf '%-25s %-20s %-10s %s\n' "IMAGE ID" "CREATED" "SIZE" "SOURCE"
+    for img_path in "$btrfs_path"/img_*; do
+        local img_id=${img_path##*/}
+
+        local source="N/A"
+        [[ -f "$img_path/img.source" ]] && source=$(< "$img_path/img.source")
+
+        local created=$(stat -c %y "$img_path" | cut -d'.' -f1)
+        local size=$(du -sh "$img_path" 2>/dev/null | awk '{print $1}')
+        printf '%-25s %-20s %-10s %s\n' "$img_id" "$created" "$size" "$source"
+        # echo -e "$img\t\t$(cat "$btrfs_path/$img"/img.source)"
+    done
+}
+
+function shebang_con_ps(){  #HELP List containers:\nSHEBANG-CON ps
+	printf '%-15s %-15s %-20s %-15s\t %s\n' "CONTAINER ID" "IMAGE ID" "CREATED" "STATUS" "COMMAND"
+	for cont_path in "$btrfs_path"/cont_*; do
+		container_id=${cont_path##*/}
+        
+		cmd=$(<"$cont_path/$container_id.cmd")
+        image=$(<"$cont_path/$container_id.image")
+        created=$(<"$cont_path/$container_id.created")
+        status="Exited"
+        [[ -f "$cont_path/$container_id.status" ]] && status=$(<"$cont_path/$container_id.status")
+
+        printf '%-15s %-15s %-20s %-15s\t %s\n' "$container_id" "$image" "$created" "$status" "$cmd"
+	done
+}
+
+function shebang_con_run(){  #HELP Create a container:\nSHEBANG-CON run <image_id> <command>
+    local interactive=0
+    if [[ "$1" == "-it" ]]; then
+        interactive=1
+        shift
+    fi
+
+    local img_id="$1"
+    shift
+    local cmd="${*:-/bin/sh}"
+    local container_id="cont_$(shuf -i 42002-42254 -n 1)"
+    local veth_host="veth0_${container_id##cont_}"
+    local veth_ns="veth1_${container_id##cont_}"
+    local netns="netns_$container_id"
+
+	[[ "$(shebang_con_check "$img_id")" == 1 ]] && echo "No image named $img_id exists" && exit 1
+	[[ "$(shebang_con_check "$container_id")" == 0 ]] && echo "UUID conflict, retrying..." && shebang_con_run "$@" && return    
+
+    local ip="$(echo "${container_id: -3}" | sed 's/0//g')" && local mac="${container_id: -3:1}:${container_id: -2}"
+
+    ip link add dev "$veth_host" type veth peer name "$veth_ns"
+    ip link set dev "$veth_host" up
+    ip link set "$veth_host" master bridge0 || {
+        echo "bridge0 does not exist. Please create it: ip link add name bridge0 type bridge && ip link set bridge0 up"
+        ip link del "$veth_host"
+        return 1
+    }
+
+    ip netns add "$netns"
+    ip link set "$veth_ns" netns "$netns"
+    ip netns exec "$netns" ip link set dev lo up
+    ip netns exec "$netns" ip link set "$veth_ns" address 02:42:ac:11:00"$mac"
+    ip netns exec "$netns" ip addr add 10.0.0."$ip"/24 dev "$veth_ns"
+    ip netns exec "$netns" ip link set "$veth_ns" up
+    ip netns exec "$netns" ip route add default via 10.0.0.1
+
+    btrfs subvolume snapshot "$btrfs_path/$img_id" "$btrfs_path/$container_id" > /dev/null
+    echo 'export TERM=xterm' >> "$btrfs_path/$container_id/etc/profile"
+    echo 'nameserver 8.8.8.8' > "$btrfs_path/$container_id/etc/resolv.conf"
+    echo "$cmd" > "$btrfs_path/$container_id/$container_id.cmd"
+    echo "$img_id" > "$btrfs_path/$container_id/$container_id.image"
+    date "+%Y-%m-%d %H:%M:%S" > "$btrfs_path/$container_id/$container_id.created"
+
+    cgcreate -g "$cgroups:/$container_id"
+    : "${SHEBANG_CON_CPU_SHARE:=512}" && cgset -r cpu.shares="$SHEBANG_CON_CPU_SHARE" "$container_id"
+    : "${SHEBANG_CON_MEMORY_LIMIT:=256M}" && cgset -r memory.limit_in_bytes="$SHEBANG_CON_MEMORY_LIMIT" "$container_id"
+
+    mkdir -p "$btrfs_path/$container_id/dev/pts"
+    mkdir -p "$btrfs_path/$container_id/proc"
+    mkdir -p "$btrfs_path/$container_id/dev"
+
+    mount --bind /dev/pts "$btrfs_path/$container_id/dev/pts"
+    ln -sf /dev/pts/ptmx "$btrfs_path/$container_id/dev/ptmx"
+    touch "$btrfs_path/$container_id/dev/console"
+
+    local hostname="cont-${container_id##cont_}"
+
+    if [[ "$interactive" -eq 1 ]]; then
+        setsid cgexec -g "$cgroups:/$container_id" \
+            ip netns exec "$netns" \
+            unshare -f -m -u -i -p --pid --mount-proc \
+            chroot "$btrfs_path/$container_id" \
+            script -q -c "/bin/mount -t proc proc /proc && hostname $hostname && exec /bin/sh -l" /dev/null
+    else
+        cgexec -g "$cgroups:/$container_id" \
+            ip netns exec "$netns" \
+            unshare -f -m -u -i -p --mount-proc \
+            chroot "$btrfs_path/$container_id" \
+            /bin/sh -c "/bin/mount -t proc proc /proc && hostname $hostname &&  exec $cmd" \
+            2>&1 | tee "$btrfs_path/$container_id"/"$container_id".log || true
+    fi
+
+    # When using cgroups v2
+    # : "${SHEBANG_CON_CPU_WEIGHT:=512}"
+    # : "${SHEBANG_CON_MEMORY_MAX:=256M}"
+
+    # systemd-run \
+    #     --unit="shebang-$container_id" \
+    #     --property=MemoryMax="$SHEBANG_CON_MEMORY_MAX" \
+    #     --property=CPUWeight="$SHEBANG_CON_CPU_WEIGHT" \
+    #     --collect \
+    #     ip netns exec "$netns" \
+    #     unshare -f -m -u -i -p --mount-proc \
+    #     chroot "$btrfs_path/$container_id" \
+    #     /bin/sh -c "/bin/mount -t proc proc /proc && $cmd" \
+    #     2>&1 | tee "$btrfs_path/$container_id"/"$container_id".log || true
+
+    echo "Exited ($?)" > "$btrfs_path/$container_id/$container_id.status"
+
+    umount "$btrfs_path/$container_id/dev/pts"
+
+    ip link del dev "$veth_host"
+    ip netns del "$netns"
+}
+
+function shebang_con_exec(){ #HELP Execute a command in a running container:\nSHEBANG-CON exec <container_id> <command>
+    local container_id="$1"
+    [[ "$(shebang_con_check "$container_id")" == 1 ]] && echo "[Error] No container named "$container_id" exists." && exit 1
+
+    cid="$(ps o ppid,pid | grep "^$(ps o pid,cmd | grep -E "^\ *[0-9]+ unshare.*$container_id" | awk '{print $1}')" \
+        | awk '{print $2}')"
+    [[ ! $cid =~ ^\ *[0-9]+$ ]] && echo "Container "$container_id" exists but is not running" && exit 1
+    nsenter -t "$cid" -m -u -i -n -p chroot "$btrfs_path/$container_id" "${@:2}"
+}
+
+function shebang_con_logs(){ #HELP View logs from a container:\nSHEBANG-CON logs <container_id>
+    local container_id="$1"
+    [[ "$(shebang_con_check "$container_id")" == 1 ]] && echo "[Error] No container named "$container_id" exists." && exit 1
+    cat "$btrfs_path/$container_id"/"$container_id".log
+}
+
+function shebang_con_commit(){ #HELP Commit a container to an image:\nSHEBANG-CON commit <container_id> <image_id>
+    local container_id="$1"
+    local image_id="$2"
+    [[ "$(shebang_con_check "$container_id")" == 1 ]] && echo "[Error] No container named "$container_id" exists." && exit 1
+    [[ "$(shebang_con_check "$image_id")" == 1 ]] && echo "[Error] No image named "$image_id" exists." && exit 1
+
+    shebang_con_rm "$image_id" && btrfs subvolume snapshot "$btrfs_path/$container_id" "$btrfs_path/$image_id" > /dev/null
+    echo "Committed: $container_id to $image_id"
+}
+
+function shebang_con_help(){
+    local file="${1:-"$0"}"
+    sed -n "s/^.*#HELP\\s//p;" < "$file" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!SHEBANG-CON!${file/!/\\!}!g"
+}
+
+[[ -z "${1-}" ]] && shebang_con_help "$0"
+case $1 in
+    init|pull|rm|images|ps|run|exec|logs|commit|help) 
+        shebang_con_"$1" "${@:2}"
+        ;;
+    *) 
+        echo "[Error] Unknown command: $1" >&2
+        shebang_con_help "$0" 
+        ;;
+esac
