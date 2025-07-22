@@ -6,14 +6,15 @@ echo "[+] Installing required packages..."
 yum install -y epel-release
 yum install -y autoconf automake btrfs-progs docker \
                gettext-devel git libcgroup-tools libtool \
-               python2-pip iproute iptables bridge-utils
+               python2-pip iproute iptables bridge-utils jq
 
 echo "[+] Setting up Btrfs loopback filesystem..."
 
 fallocate -l 10G /root/btrfs.img
 mkdir -p /var/shebang-con
-mkfs.btrfs /root/btrfs.img
-mount -o loop /root/btrfs.img /var/shebang-con
+mkfs.btrfs -f /root/btrfs.img
+mount -o loop /root/btrfs.img /var/shebang-con 
+echo "/root/btrfs.img /var/shebang-con btrfs loop 0 0" | sudo tee -a /etc/fstab
 
 echo "[+] Installing Python 3 and pip..."
 yum install -y python3 python3-pip
